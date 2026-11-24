@@ -2,6 +2,7 @@ using System.CodeDom.Compiler;
 using System.Collections.Immutable;
 using System.Text;
 using Cutout.Exceptions;
+using Firebreak;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
@@ -20,10 +21,25 @@ namespace Cutout;
 #pragma warning restore RS1038
 public sealed partial class TemplateSourceGenerator : IIncrementalGenerator
 {
-    private readonly FirebreakPocCounters _pocCounters = new();
+#pragma warning disable RS2008
+    private static readonly DiagnosticDescriptor TemplateParseError = new DiagnosticDescriptor(
+        "CUTOUT001",
+        "Template parsing error",
+        "Failed to parse template for {0}: {1}",
+        "Cutout",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true
+    );
 
-    /// <summary>POC instrumentation for the firebreak-poc tests.</summary>
-    public FirebreakPocCounters PocCounters => _pocCounters;
+    private static readonly DiagnosticDescriptor TemplateRenderError = new DiagnosticDescriptor(
+        "CUTOUT002",
+        "Template rendering error",
+        "Failed to render template for {0}: {1}",
+        "Cutout",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true
+    );
+#pragma warning restore RS2008
 
     /// <inheritdoc />
     public void Initialize(IncrementalGeneratorInitializationContext context)
@@ -35,47 +51,15 @@ public sealed partial class TemplateSourceGenerator : IIncrementalGenerator
             ctx.AddSource("RenderUtilities.g", EmbeddedFiles.RenderUtilities_Source);
         });
 
-        // attribute-based template methods
-        // Firebreak POC: entry stage captures failures as Err (e.g. attributes.Single
-        // throwing inside BuildTemplateDetails) instead of letting exceptions reach
-        // Roslyn as AD0001, which would drop the generator's whole output.
         var attributeTemplateProvider = context.SyntaxProvider.ForAttributeWithMetadataName(
             "Cutout.TemplateAttribute",
             IsTemplateMethod,
-            (ctx, token) =>
-            {
-                _pocCounters.EntryInvocations++;
-                return BuildTemplateDetails(ctx, token);
-            }
+            BuildTemplateDetails
         );
 
-        // Parse stage: exceptions (ParseException) become located Err values.
-        // Err items pass through untouched — they are cached as value-equal data.
-        var parsedAttributeTemplates = attributeTemplateProvider.Select(
-            details =>
-            {
-                _pocCounters.ParseInvocations++;
-                try
-                {
-                    _ = details.AttributeDetails.Syntaxes;
-                }
-                catch (ParseException ex)
-                {
-                    throw new LocatedFailureException(
-                        GenerationError.At(
-                            FirebreakDescriptors.TemplateParseError,
-                            $"{details.ClassDetails.Name}.{details.MethodDetails.Name}: {ex.Message}",
-                            details.MethodDetails.MethodDeclaration
-                        )
-                    );
-                }
+        var attributeTemplates = attributeTemplateProvider;
 
-                return details;
-            },
-            d => d.MethodDetails.MethodDeclaration
-        );
-
-        context.RegisterSourceOutput(parsedAttributeTemplates, GenerateTemplate);
+        context.RegisterSourceOutput(attributeTemplates, GenerateTemplate);
 
         // external config-based template methods
         var embeddedFiles = context.AdditionalTextsProvider.Select((file, _) => file).Collect();
@@ -88,34 +72,12 @@ public sealed partial class TemplateSourceGenerator : IIncrementalGenerator
             )
             .Collect();
 
-        var fileTemplateProvider = embeddedFiles
+        var fileTemplates = embeddedFiles
             .Combine(configProvider)
             .Combine(fileTemplateAttributeProvider)
-            .SelectMany(BuildTemplateDetailsFromFile)
-            .Select(
-                d =>
-                {
-                    _pocCounters.ParseInvocations++;
-                    try
-                    {
-                        _ = d.AttributeDetails.Syntaxes;
-                    }
-                    catch (ParseException ex)
-                    {
-                        throw new LocatedFailureException(
-                            GenerationError.At(
-                                FirebreakDescriptors.TemplateParseError,
-                                $"{d.ClassDetails.Name}.{d.MethodDetails.Name}: {ex.Message}",
-                                d.MethodDetails.MethodDeclaration
-                            )
-                        );
-                    }
-                    return d;
-                },
-                d => d.MethodDetails.MethodDeclaration
-            );
+            .SelectMany(BuildTemplateDetailsFromFile);
 
-        context.RegisterSourceOutput(fileTemplateProvider, GenerateTemplate);
+        context.RegisterSourceOutput(fileTemplates, GenerateTemplate);
     }
 
     private static bool IsTemplateMethod(SyntaxNode syntax, CancellationToken token)
@@ -200,7 +162,13 @@ public sealed partial class TemplateSourceGenerator : IIncrementalGenerator
             }
             catch (Exception ex)
             {
-                entry = GenerationError.FromException(ex, methodContext.methodDeclarationSyntax);
+                entry = FirebreakPipeline.Err<TemplateMethodDetails>(
+                    GenerationError.FromException(
+                        TemplateParseError,
+                        ex,
+                        methodContext.methodDeclarationSyntax
+                    )
+                );
             }
 
             yield return entry;
@@ -230,7 +198,9 @@ public sealed partial class TemplateSourceGenerator : IIncrementalGenerator
         }
         catch (Exception ex)
         {
-            return GenerationError.FromException(ex, ctx.TargetNode);
+            return FirebreakPipeline.Err<TemplateMethodDetails>(
+                GenerationError.FromException(TemplateParseError, ex, ctx.TargetNode)
+            );
         }
     }
 
@@ -277,60 +247,70 @@ public sealed partial class TemplateSourceGenerator : IIncrementalGenerator
         );
     }
 
-    private void GenerateTemplate(
+    private static void GenerateTemplate(
         SourceProductionContext context,
         Result<TemplateMethodDetails> result
     )
     {
-        // Firebreak POC: Err items report precise, static-descriptor diagnostics.
-        // Nothing here can throw, so no item can take the whole generator down.
-        if (result is Err<TemplateMethodDetails> error)
+        context.ReportDiagnostics(result);
+
+        if (result is Err<TemplateMethodDetails>)
         {
-            _pocCounters.ReportedDiagnostics += error.Errors.Count;
-            foreach (var generationError in error.Errors)
-            {
-                context.ReportDiagnostic(generationError.ToDiagnostic());
-            }
             return;
         }
 
         var details = ((Ok<TemplateMethodDetails>)result).Value;
-        _pocCounters.OutputInvocations++;
 
-        try
+        var rendered = FirebreakPipeline.Capture(
+            () => RenderTemplateOutputs(details),
+            details.MethodDetails.MethodDeclaration,
+            TemplateRenderError
+        );
+
+        if (rendered is Ok<ImmutableArray<GeneratedSource>> ok)
         {
-            using (var writer = new StringWriter())
+            foreach (var output in ok.Value)
             {
-                var indentedWriter = new IndentedTextWriter(writer, "    ");
-
-                WriteTemplateMethod(indentedWriter, details, includeWhitespaceReceiver: false);
-                context.AddSource(
-                    $"{details.ClassDetails.Name}.{details.MethodDetails.Name}.g.cs",
-                    SourceText.From(writer.ToString(), Encoding.UTF8)
-                );
-            }
-
-            using (var writer = new StringWriter())
-            {
-                var indentedWriter = new IndentedTextWriter(writer, "    ");
-
-                WriteTemplateMethod(indentedWriter, details, includeWhitespaceReceiver: true);
-
-                context.AddSource(
-                    $"{details.ClassDetails.Name}.{details.MethodDetails.Name}.wsr.g.cs",
-                    SourceText.From(writer.ToString(), Encoding.UTF8)
-                );
+                context.AddSource(output.HintName, SourceText.From(output.Content, Encoding.UTF8));
             }
         }
-        catch (Exception ex)
+        else if (rendered is Err<ImmutableArray<GeneratedSource>> error)
         {
-            // Simulated-renderer-bug path: even a rendering failure is a located
-            // diagnostic, not a generator crash.
-            _pocCounters.ReportedDiagnostics++;
-            context.ReportDiagnostic(
-                GenerationError
-                    .FromException(ex, details.MethodDetails.MethodDeclaration)
-                    .ToDiagnostic()
+            foreach (var diagnostic in error.ToDiagnostics())
+            {
+                context.ReportDiagnostic(diagnostic);
+            }
+        }
+    }
+
+    private sealed record GeneratedSource(string HintName, string Content);
+
+    private static ImmutableArray<GeneratedSource> RenderTemplateOutputs(
+        TemplateMethodDetails details
+    )
+    {
+        var outputs = new GeneratedSource[]
+        {
+            RenderTemplateMethod(details, includeWhitespaceReceiver: false, hintSuffix: ".g.cs"),
+            RenderTemplateMethod(details, includeWhitespaceReceiver: true, hintSuffix: ".wsr.g.cs"),
+        };
+
+        return outputs.ToImmutableArray();
+    }
+
+    private static GeneratedSource RenderTemplateMethod(
+        TemplateMethodDetails details,
+        bool includeWhitespaceReceiver,
+        string hintSuffix
+    )
+    {
+        using (var writer = new StringWriter())
+        {
+            var indentedWriter = new IndentedTextWriter(writer, "    ");
+            WriteTemplateMethod(indentedWriter, details, includeWhitespaceReceiver);
+            return new GeneratedSource(
+                $"{details.ClassDetails.Name}.{details.MethodDetails.Name}{hintSuffix}",
+                writer.ToString()
             );
         }
     }
